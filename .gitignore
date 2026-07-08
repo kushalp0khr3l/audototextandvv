@@ -1,0 +1,19 @@
+*.iml
+.gradle
+/local.properties
+/.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Whisper model binary (too large for git — download separately)
+app/src/main/assets/*.bin
+
+# Temp clone used during setup
+/temp_whisper/
+
+# Nested git repo inside whisper.cpp source
+app/src/main/cpp/whisper/.git
