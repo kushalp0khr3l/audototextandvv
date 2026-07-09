@@ -22,6 +22,7 @@ class AudioRecorder(private val context: Context) {
     private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
 
     fun startRecording(coroutineScope: CoroutineScope): Boolean {
+        if (isRecording) return false
         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             return false
         }

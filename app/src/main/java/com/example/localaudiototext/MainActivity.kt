@@ -66,33 +66,39 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private var isRecordingUiState = false
+
     private fun setupUIListeners() {
         recordButton.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     val started = sttManager.startListening()
                     if (started) {
+                        isRecordingUiState = true
                         statusTextView.text = "Status: Recording..."
                         resultTextView.text = "Recording audio..."
                         recordButton.text = "RELEASE TO TRANSCRIBE"
                         recordButton.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_red_dark)
                     } else {
-                        Toast.makeText(this, "Failed to start recording.", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "Whisper is busy. Please wait.", Toast.LENGTH_SHORT).show()
                     }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    statusTextView.text = "Status: Transcribing..."
-                    resultTextView.text = "Processing speech to text..."
-                    recordButton.text = "HOLD TO TALK"
-                    recordButton.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_blue_dark)
-                    
-                    sttManager.stopListening { text ->
-                        statusTextView.text = "Status: Whisper Ready!"
-                        if (text.isNotEmpty()) {
-                            resultTextView.text = text
-                        } else {
-                            resultTextView.text = "(No speech detected or whisper failed to transcribe)"
+                    if (isRecordingUiState) {
+                        isRecordingUiState = false
+                        statusTextView.text = "Status: Transcribing..."
+                        resultTextView.text = "Processing speech to text..."
+                        recordButton.text = "HOLD TO TALK"
+                        recordButton.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_blue_dark)
+                        
+                        sttManager.stopListening { text ->
+                            statusTextView.text = "Status: Whisper Ready!"
+                            if (text.isNotEmpty()) {
+                                resultTextView.text = text
+                            } else {
+                                resultTextView.text = "(No speech detected or whisper failed to transcribe)"
+                            }
                         }
                     }
                     true
