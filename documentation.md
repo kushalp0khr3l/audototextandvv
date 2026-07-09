@@ -256,6 +256,7 @@ class YourActivity : AppCompatActivity() {
 
     private lateinit var sttManager: SpeechToTextManager
     private var isSttReady = false
+    private var isRecordingUiState = false
 
     // Step 1: Register permission launcher
     private val micPermissionLauncher = registerForActivityResult(
@@ -302,20 +303,24 @@ class YourActivity : AppCompatActivity() {
                 MotionEvent.ACTION_DOWN -> {
                     val started = sttManager.startListening()
                     if (started) {
+                        isRecordingUiState = true
                         searchBar.hint = "Listening..."
                         // Optional: change mic button icon/color to indicate recording
                     } else {
-                        Toast.makeText(this, "Mic permission required", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "Whisper is busy. Please wait.", Toast.LENGTH_SHORT).show()
                     }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    searchBar.hint = "Processing..."
-                    sttManager.stopListening { text ->
-                        if (text.isNotEmpty()) {
-                            searchBar.setText(text)
-                        } else {
-                            searchBar.hint = "No speech detected. Try again."
+                    if (isRecordingUiState) {
+                        isRecordingUiState = false
+                        searchBar.hint = "Processing..."
+                        sttManager.stopListening { text ->
+                            if (text.isNotEmpty()) {
+                                searchBar.setText(text)
+                            } else {
+                                searchBar.hint = "No speech detected. Try again."
+                            }
                         }
                     }
                     true
