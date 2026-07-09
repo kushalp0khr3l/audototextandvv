@@ -17,3 +17,15 @@ app/src/main/assets/*.bin
 
 # Nested git repo inside whisper.cpp source
 app/src/main/cpp/whisper/.git
+
+# ── KittenTTS (TTS backend) ──
+
+# ONNX model + voice files (download from HuggingFace)
+app/src/main/assets/model/
+
+# espeak-ng phoneme data (built from source on Linux/WSL)
+app/src/main/assets/espeak-ng-data/
+
+# espeak-ng C source (cloned as build dependency)
+app/src/main/cpp/espeak-ng/
+

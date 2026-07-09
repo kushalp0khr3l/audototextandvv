@@ -55,6 +55,19 @@ class AudioRecorder(private val context: Context) {
         return true
     }
 
+    /**
+     * Returns a snapshot of the currently recorded audio without stopping recording.
+     * Used for real-time intermediate transcription while the user is still speaking.
+     *
+     * @param trim If true, applies VAD silence trimming to the snapshot
+     */
+    fun getCurrentlyRecordedAudio(trim: Boolean = true): FloatArray {
+        val snapshot = synchronized(audioData) {
+            audioData.toList()
+        }
+        return if (trim) trimSilence(snapshot) else toFloatArray(snapshot)
+    }
+
     suspend fun stopAndGetAudio(): FloatArray {
         isRecording = false
         recordingJob?.join()
@@ -63,11 +76,61 @@ class AudioRecorder(private val context: Context) {
         audioRecord?.release()
         audioRecord = null
 
-        val floats = synchronized(audioData) {
-            FloatArray(audioData.size) { i ->
-                audioData[i] / 32768.0f
+        val rawAudio = synchronized(audioData) {
+            audioData.toList()
+        }
+        
+        return trimSilence(rawAudio)
+    }
+
+    /**
+     * Energy-based Voice Activity Detection (VAD).
+     * Trims leading and trailing silence to significantly reduce STT processing time.
+     */
+    private fun trimSilence(audio: List<Short>): FloatArray {
+        if (audio.isEmpty()) return FloatArray(0)
+
+        val chunkSize = (sampleRate * 0.02).toInt() // 20ms chunks (320 samples)
+        val threshold = 50.0 // RMS threshold (out of 32768)
+        val padding = (sampleRate * 0.2).toInt() // 200ms padding
+
+        var firstActive = -1
+        var lastActive = -1
+
+        // Scan for speech boundaries
+        for (i in audio.indices step chunkSize) {
+            val end = minOf(i + chunkSize, audio.size)
+            var sumSquare = 0.0
+            for (j in i until end) {
+                val sample = audio[j].toDouble()
+                sumSquare += sample * sample
+            }
+            val rms = Math.sqrt(sumSquare / (end - i))
+
+            if (rms > threshold) {
+                if (firstActive == -1) firstActive = i
+                lastActive = end
             }
         }
-        return floats
+
+        // If no speech detected, return empty
+        if (firstActive == -1) return FloatArray(0)
+
+        // Add padding
+        val startIdx = maxOf(0, firstActive - padding)
+        val endIdx = minOf(audio.size, lastActive + padding)
+
+        val trimmedSize = endIdx - startIdx
+        if (trimmedSize <= 0) return FloatArray(0)
+
+        // Convert to FloatArray (-1.0 to 1.0) for Whisper
+        return FloatArray(trimmedSize) { i ->
+            audio[startIdx + i] / 32768.0f
+        }
+    }
+
+    /** Convert raw Short samples to normalized FloatArray for Whisper. */
+    private fun toFloatArray(audio: List<Short>): FloatArray {
+        return FloatArray(audio.size) { i -> audio[i] / 32768.0f }
     }
 }

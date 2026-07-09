@@ -5,7 +5,8 @@
     android:orientation="vertical"
     android:padding="24dp"
     android:gravity="center_horizontal"
-    android:background="#F5F5F5">
+    android:background="#F5F5F5"
+    android:fitsSystemWindows="true">
 
     <TextView
         android:id="@+id/titleTextView"
@@ -49,7 +50,19 @@
         android:textStyle="bold"
         android:backgroundTint="#2196F3"
         android:textColor="#FFFFFF"
-        android:layout_marginBottom="30dp"
+        android:layout_marginBottom="10dp"
+        android:enabled="false" />
+
+    <Button
+        android:id="@+id/speakerButton"
+        android:layout_width="200dp"
+        android:layout_height="60dp"
+        android:text="SPEAKER"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:backgroundTint="#4CAF50"
+        android:textColor="#FFFFFF"
+        android:layout_marginBottom="20dp"
         android:enabled="false" />
 
     <TextView

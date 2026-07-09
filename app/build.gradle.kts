@@ -17,6 +17,7 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++11 -O3"
+                arguments += "-DCMAKE_BUILD_TYPE=Release"
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
             }
         }
@@ -40,6 +41,12 @@ android {
         }
     }
     ndkVersion = "25.1.8937393"
+
+    // Prevent compression of ONNX model and NPZ voice files
+    // (ONNX Runtime needs to memory-map these directly)
+    androidResources {
+        noCompress += listOf("onnx", "npz")
+    }
 }
 
 dependencies {
@@ -47,6 +54,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.material)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation(libs.onnxruntime.android)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)

@@ -1,14 +1,19 @@
 package com.example.localaudiototext
 
 import android.content.Context
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import android.util.Log
+import kotlinx.coroutines.*
 import java.io.File
 import java.io.FileOutputStream
 
 class SpeechToTextManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "SpeechToTextManager"
+        private const val PARTIAL_INTERVAL_MS = 1000L  // Run partial transcription every 1 second
+        private const val MIN_AUDIO_SAMPLES = 8000     // 0.5s at 16kHz — skip if too short
+    }
+
     enum class State {
         UNINITIALIZED,
         IDLE,
@@ -19,6 +24,10 @@ class SpeechToTextManager(private val context: Context) {
     private val audioRecorder = AudioRecorder(context)
     private var whisperContextPtr: Long = 0L
     private val scope = CoroutineScope(Dispatchers.Main)
+
+    // Real-time transcription state
+    private var partialJob: Job? = null
+    @Volatile private var isTranscribing = false
 
     var state = State.UNINITIALIZED
         private set
@@ -42,13 +51,53 @@ class SpeechToTextManager(private val context: Context) {
         state = State.IDLE
     }
 
-    fun startListening(): Boolean {
+    /**
+     * Start recording and optionally receive real-time partial transcription results.
+     *
+     * @param onPartialResult Callback invoked on the Main thread with intermediate
+     *                        transcription text every ~1 second. Pass null to disable
+     *                        real-time updates (original batch-only behavior).
+     * @return true if recording started successfully
+     */
+    fun startListening(onPartialResult: ((String) -> Unit)? = null): Boolean {
         if (state != State.IDLE) {
             return false
         }
         val started = audioRecorder.startRecording(scope)
         if (started) {
             state = State.RECORDING
+
+            // Launch the real-time partial transcription loop if callback provided
+            if (onPartialResult != null) {
+                partialJob = scope.launch {
+                    // Give the microphone a moment to capture initial audio
+                    delay(PARTIAL_INTERVAL_MS)
+
+                    while (state == State.RECORDING) {
+                        if (!isTranscribing) {
+                            isTranscribing = true
+                            try {
+                                val audio = withContext(Dispatchers.Default) {
+                                    audioRecorder.getCurrentlyRecordedAudio(trim = true)
+                                }
+                                if (audio.size >= MIN_AUDIO_SAMPLES) {
+                                    val partial = withContext(Dispatchers.Default) {
+                                        WhisperLib.fullTranscribe(whisperContextPtr, audio)
+                                    }
+                                    if (state == State.RECORDING && partial.isNotBlank()) {
+                                        onPartialResult(partial.trim())
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Partial transcription failed", e)
+                            } finally {
+                                isTranscribing = false
+                            }
+                        }
+                        delay(PARTIAL_INTERVAL_MS)
+                    }
+                }
+            }
         }
         return started
     }
@@ -59,8 +108,17 @@ class SpeechToTextManager(private val context: Context) {
             return
         }
         
+        // Cancel the partial transcription loop
+        partialJob?.cancel()
+        partialJob = null
+
         state = State.TRANSCRIBING
         scope.launch {
+            // Wait for any in-flight partial transcription to finish
+            while (isTranscribing) {
+                delay(50)
+            }
+
             val audioData = audioRecorder.stopAndGetAudio()
             if (audioData.isEmpty()) {
                 state = State.IDLE
@@ -77,6 +135,8 @@ class SpeechToTextManager(private val context: Context) {
     }
 
     fun release() {
+        partialJob?.cancel()
+        partialJob = null
         if (whisperContextPtr != 0L) {
             WhisperLib.freeContext(whisperContextPtr)
             whisperContextPtr = 0L
@@ -84,4 +144,3 @@ class SpeechToTextManager(private val context: Context) {
         state = State.UNINITIALIZED
     }
 }
-
