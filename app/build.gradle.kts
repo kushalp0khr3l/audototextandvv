@@ -18,16 +18,16 @@ android {
             cmake {
                 cppFlags += "-std=c++11 -O3"
                 arguments += "-DCMAKE_BUILD_TYPE=Release"
-                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+                abiFilters += listOf("arm64-v8a")
             }
         }
     }
 
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
     compileOptions {
