@@ -1,17 +1,26 @@
 package com.example.localaudiototext
 
 import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Log
-import kotlinx.coroutines.*
-import java.io.File
-import java.io.FileOutputStream
 
+/**
+ * Manages Speech-To-Text using the native Android SpeechRecognizer API.
+ *
+ * Handles the "hold-to-talk" pattern correctly by auto-restarting the recognizer
+ * when it stops due to silence (which it does frequently), accumulating text
+ * across multiple recognition cycles for as long as the button is held.
+ *
+ * Uses EXTRA_PREFER_OFFLINE = true to request offline recognition.
+ */
 class SpeechToTextManager(private val context: Context) {
 
     companion object {
         private const val TAG = "SpeechToTextManager"
-        private const val PARTIAL_INTERVAL_MS = 1000L  // Run partial transcription every 1 second
-        private const val MIN_AUDIO_SAMPLES = 8000     // 0.5s at 16kHz — skip if too short
     }
 
     enum class State {
@@ -21,126 +30,194 @@ class SpeechToTextManager(private val context: Context) {
         TRANSCRIBING
     }
 
-    private val audioRecorder = AudioRecorder(context)
-    private var whisperContextPtr: Long = 0L
-    private val scope = CoroutineScope(Dispatchers.Main)
-
-    // Real-time transcription state
-    private var partialJob: Job? = null
-    @Volatile private var isTranscribing = false
-
-    var state = State.UNINITIALIZED
+    var state = State.IDLE
         private set
 
-    suspend fun initialize(modelFileName: String) = withContext(Dispatchers.IO) {
-        if (state != State.UNINITIALIZED) return@withContext
-        
-        val modelFile = File(context.filesDir, modelFileName)
-        if (!modelFile.exists()) {
-            context.assets.open(modelFileName).use { inputStream ->
-                FileOutputStream(modelFile).use { outputStream ->
-                    inputStream.copyTo(outputStream)
-                }
-            }
+    private var recognizer: SpeechRecognizer? = null
+    private var finalResultCallback: ((String) -> Unit)? = null
+    private var partialResultCallback: ((String) -> Unit)? = null
+
+    // Accumulates confirmed sentences across auto-restart cycles.
+    private val accumulatedText = StringBuilder()
+    // Latest partial text from the current cycle (not yet confirmed).
+    private var lastPartialText = ""
+    // True while the user is holding the button down.
+    @Volatile private var isUserListening = false
+
+    init {
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(context)
+        } else {
+            Log.e(TAG, "SpeechRecognizer not available on this device")
         }
-        
-        whisperContextPtr = WhisperLib.initContext(modelFile.absolutePath)
-        if (whisperContextPtr == 0L) {
-            throw IllegalStateException("Failed to initialize whisper context")
-        }
-        state = State.IDLE
     }
 
     /**
-     * Start recording and optionally receive real-time partial transcription results.
+     * Start listening. Calls [onPartialResult] with live partial results.
      *
-     * @param onPartialResult Callback invoked on the Main thread with intermediate
-     *                        transcription text every ~1 second. Pass null to disable
-     *                        real-time updates (original batch-only behavior).
-     * @return true if recording started successfully
+     * @return true if listening started successfully
      */
     fun startListening(onPartialResult: ((String) -> Unit)? = null): Boolean {
-        if (state != State.IDLE) {
+        if (recognizer == null) {
+            Log.e(TAG, "SpeechRecognizer is not available")
             return false
         }
-        val started = audioRecorder.startRecording(scope)
-        if (started) {
-            state = State.RECORDING
+        if (state == State.RECORDING || state == State.TRANSCRIBING) return false
 
-            // Launch the real-time partial transcription loop if callback provided
-            if (onPartialResult != null) {
-                partialJob = scope.launch {
-                    // Give the microphone a moment to capture initial audio
-                    delay(PARTIAL_INTERVAL_MS)
+        // Reset state for this new session
+        accumulatedText.clear()
+        lastPartialText = ""
+        finalResultCallback = null
+        partialResultCallback = onPartialResult
+        isUserListening = true
 
-                    while (state == State.RECORDING) {
-                        if (!isTranscribing) {
-                            isTranscribing = true
-                            try {
-                                val audio = withContext(Dispatchers.Default) {
-                                    audioRecorder.getCurrentlyRecordedAudio(trim = true)
-                                }
-                                if (audio.size >= MIN_AUDIO_SAMPLES) {
-                                    val partial = withContext(Dispatchers.Default) {
-                                        WhisperLib.fullTranscribe(whisperContextPtr, audio)
-                                    }
-                                    if (state == State.RECORDING && partial.isNotBlank()) {
-                                        onPartialResult(partial.trim())
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                Log.w(TAG, "Partial transcription failed", e)
-                            } finally {
-                                isTranscribing = false
-                            }
-                        }
-                        delay(PARTIAL_INTERVAL_MS)
-                    }
-                }
-            }
-        }
-        return started
+        startRecognizerInternal()
+        state = State.RECORDING
+        return true
     }
 
+    /**
+     * Stop the microphone and collect the final accumulated result.
+     *
+     * @param onResult Callback with the full transcription text
+     */
     fun stopListening(onResult: (String) -> Unit) {
-        if (state != State.RECORDING) {
+        if (state != State.RECORDING && state != State.TRANSCRIBING) {
             onResult("")
             return
         }
-        
-        // Cancel the partial transcription loop
-        partialJob?.cancel()
-        partialJob = null
-
+        isUserListening = false
+        finalResultCallback = onResult
         state = State.TRANSCRIBING
-        scope.launch {
-            // Wait for any in-flight partial transcription to finish
-            while (isTranscribing) {
-                delay(50)
+        recognizer?.stopListening()
+    }
+
+    /**
+     * Release all resources. Call from Activity.onDestroy().
+     */
+    fun release() {
+        isUserListening = false
+        recognizer?.destroy()
+        recognizer = null
+        state = State.UNINITIALIZED
+    }
+
+    // ── Internal ──
+
+    /**
+     * (Re-)starts the underlying SpeechRecognizer. Called on first start and
+     * automatically after each auto-stop cycle while the user is still holding.
+     */
+    private fun startRecognizerInternal() {
+        val rec = recognizer ?: return
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        }
+
+        rec.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                Log.d(TAG, "Ready for speech")
             }
 
-            val audioData = audioRecorder.stopAndGetAudio()
-            if (audioData.isEmpty()) {
-                state = State.IDLE
-                onResult("")
-                return@launch
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {
+                Log.d(TAG, "End of speech detected")
             }
-            
-            val result = withContext(Dispatchers.Default) {
-                WhisperLib.fullTranscribe(whisperContextPtr, audioData)
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                val partial = partialResults
+                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull() ?: return
+                if (partial.isNotBlank()) {
+                    lastPartialText = partial
+                    // Show accumulated + current partial to user
+                    partialResultCallback?.invoke(buildCurrentText())
+                }
             }
-            state = State.IDLE
-            onResult(result.trim())
+
+            override fun onResults(results: Bundle?) {
+                val text = results
+                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull() ?: ""
+
+                Log.d(TAG, "onResults: '$text', userListening=$isUserListening")
+
+                // Commit this cycle's result into the accumulator
+                val committed = if (text.isNotBlank()) text else lastPartialText
+                if (committed.isNotBlank()) {
+                    if (accumulatedText.isNotEmpty()) accumulatedText.append(" ")
+                    accumulatedText.append(committed)
+                }
+                lastPartialText = ""
+
+                if (isUserListening) {
+                    // User is still holding — show committed text and restart silently
+                    partialResultCallback?.invoke(accumulatedText.toString())
+                    startRecognizerInternal()
+                } else {
+                    // User has released — deliver final result
+                    deliverResult()
+                }
+            }
+
+            override fun onError(error: Int) {
+                Log.e(TAG, "Recognition error: ${recognizerErrorToString(error)}, userListening=$isUserListening")
+
+                val isRecoverable = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                        error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                        error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+
+                if (isUserListening && isRecoverable) {
+                    // Auto-stopped with a soft error while holding — restart silently
+                    startRecognizerInternal()
+                } else {
+                    // Unrecoverable OR user already released — deliver what we have
+                    deliverResult()
+                }
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+
+        rec.startListening(intent)
+    }
+
+    /** Combines accumulated confirmed sentences with any trailing partial. */
+    private fun buildCurrentText(): String {
+        val acc = accumulatedText.toString()
+        return when {
+            acc.isNotBlank() && lastPartialText.isNotBlank() -> "$acc $lastPartialText"
+            acc.isNotBlank() -> acc
+            else -> lastPartialText
         }
     }
 
-    fun release() {
-        partialJob?.cancel()
-        partialJob = null
-        if (whisperContextPtr != 0L) {
-            WhisperLib.freeContext(whisperContextPtr)
-            whisperContextPtr = 0L
-        }
-        state = State.UNINITIALIZED
+    /** Fires the final callback with everything captured so far. */
+    private fun deliverResult() {
+        val finalText = buildCurrentText()
+        Log.d(TAG, "Delivering final result: '$finalText'")
+        state = State.IDLE
+        finalResultCallback?.invoke(finalText)
+        finalResultCallback = null
+        accumulatedText.clear()
+        lastPartialText = ""
+    }
+
+    private fun recognizerErrorToString(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
+        SpeechRecognizer.ERROR_CLIENT -> "Client error"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions"
+        SpeechRecognizer.ERROR_NETWORK -> "Network error"
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
+        SpeechRecognizer.ERROR_NO_MATCH -> "No match found"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer busy"
+        SpeechRecognizer.ERROR_SERVER -> "Server error"
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Speech timeout"
+        else -> "Unknown error ($error)"
     }
 }

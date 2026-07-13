@@ -1,67 +1,28 @@
 package com.example.localaudiototext
 
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
-import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
-import kotlinx.coroutines.*
-import org.json.JSONObject
+import java.util.Locale
 
 /**
- * Frontend-facing facade for Text-To-Speech using KittenTTS.
+ * Manages Text-To-Speech using the native Android TextToSpeech API.
  *
- * Mirrors the simplicity of SpeechToTextManager. Handles:
- *  - Model loading and initialization
- *  - JSON input parsing
- *  - Audio playback via AudioTrack
- *  - Cancellation (for STT preemption)
- *
- * ## Usage (Frontend)
- * ```kotlin
- * val ttsManager = TextToSpeechManager(context)
- *
- * // Initialize once (e.g. in onCreate)
- * lifecycleScope.launch {
- *     ttsManager.initialize()
- * }
- *
- * // Speak from JSON
- * ttsManager.speak("""{"text":"Hello world","voice":"Hugo","speed":1.0}""")
- *
- * // Cancel (e.g. when STT is requested)
- * ttsManager.stop()
- *
- * // Cleanup (e.g. in onDestroy)
- * ttsManager.release()
- * ```
- *
- * ## JSON Input Format
- * ```json
- * {
- *   "text": "The text to speak",      // required
- *   "voice": "Hugo",                  // optional, default "Hugo"
- *   "speed": 1.0                       // optional, default 1.0
- * }
- * ```
- *
- * ## Available Voices
- * Bella, Jasper, Luna, Bruno, Rosie, Hugo, Kiki, Leo
+ * Usage:
+ *  val ttsManager = TextToSpeechManager(context)
+ *  ttsManager.initialize()          // must be called first; fires onReady when done
+ *  ttsManager.speak("Hello world")
+ *  ttsManager.stop()
+ *  ttsManager.release()             // call in onDestroy()
  */
 class TextToSpeechManager(private val context: Context) {
 
     companion object {
         private const val TAG = "TextToSpeechManager"
+        private const val UTTERANCE_ID = "tts_utterance"
     }
 
-    /**
-     * Current state of the TTS manager.
-     * - UNINITIALIZED: loadModel() has not been called yet
-     * - IDLE: Ready to accept speak() calls
-     * - LOADING: Model is being loaded (during initialize())
-     * - SPEAKING: Currently synthesizing and playing audio
-     */
     enum class State {
         UNINITIALIZED,
         IDLE,
@@ -69,229 +30,132 @@ class TextToSpeechManager(private val context: Context) {
         SPEAKING
     }
 
-    private val engine = KittenTTSEngine()
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private var speakJob: Job? = null
-    private var audioTrack: AudioTrack? = null
-
-    /** Current state — observable by the frontend for UI updates. */
     var state = State.UNINITIALIZED
         private set
 
-    /** Callback invoked when state changes. Set by frontend for UI updates. */
+    /** Callback invoked whenever state changes — use this to update UI. */
     var onStateChanged: ((State) -> Unit)? = null
 
-    /** Callback invoked when speech playback completes naturally (not cancelled). */
+    /** Callback fired when speech finishes naturally (not cancelled). */
     var onSpeakComplete: (() -> Unit)? = null
 
-    /** Callback invoked when an error occurs during synthesis or playback. */
+    /** Callback fired on any TTS error. */
     var onError: ((String) -> Unit)? = null
 
-    /**
-     * Initialize the TTS engine. Loads the ONNX model, voice embeddings,
-     * and espeak-ng phonemizer. Call once during app startup.
-     *
-     * This is a suspend function — call from a coroutine (e.g. lifecycleScope.launch).
-     *
-     * @throws RuntimeException if model files are missing from assets
-     */
-    suspend fun initialize() = withContext(Dispatchers.IO) {
-        if (state != State.UNINITIALIZED) return@withContext
+    private var tts: TextToSpeech? = null
 
+    /**
+     * Initialize the TTS engine. This is asynchronous; the engine will be
+     * ready shortly after the callback returns SUCCESS.
+     *
+     * Safe to call multiple times — ignored if already initialized.
+     */
+    fun initialize() {
+        if (state != State.UNINITIALIZED) return
         updateState(State.LOADING)
-        try {
-            engine.loadModel(context)
-            updateState(State.IDLE)
-            Log.i(TAG, "TTS engine initialized successfully")
-        } catch (e: Exception) {
-            updateState(State.UNINITIALIZED)
-            Log.e(TAG, "TTS engine initialization failed", e)
-            throw e
+
+        tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                val result = tts?.setLanguage(Locale.US)
+                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    Log.e(TAG, "US English is not supported on this device")
+                    updateState(State.UNINITIALIZED)
+                    onError?.invoke("TTS language not supported. Please install English voice data.")
+                } else {
+                    setupUtteranceListener()
+                    updateState(State.IDLE)
+                    Log.i(TAG, "TTS engine initialized successfully")
+                }
+            } else {
+                Log.e(TAG, "TTS initialization failed with status: $status")
+                updateState(State.UNINITIALIZED)
+                onError?.invoke("TTS engine failed to initialize.")
+            }
         }
     }
 
     /**
-     * Speak text from a JSON-formatted string.
-     *
-     * JSON format:
-     * ```json
-     * {"text": "Hello world", "voice": "Hugo", "speed": 1.0}
-     * ```
-     *
-     * - "text" is required
-     * - "voice" defaults to "Hugo" if omitted
-     * - "speed" defaults to 1.0 if omitted
-     *
-     * If currently speaking, the previous speech is cancelled first.
-     * If state is not IDLE, the call is ignored (logs a warning).
-     *
-     * @param json JSON string with text, voice, and speed fields
+     * Speak the given text aloud.
+     * If already speaking, the previous speech is stopped first.
      */
-    fun speak(json: String) {
-        if (state == State.UNINITIALIZED || state == State.LOADING) {
-            Log.w(TAG, "speak() called but engine is $state — ignoring")
-            onError?.invoke("TTS engine not ready (state: $state)")
+    fun speak(text: String) {
+        val engine = tts
+        if (engine == null || state == State.UNINITIALIZED || state == State.LOADING) {
+            Log.w(TAG, "speak() called but TTS not ready (state=$state)")
+            onError?.invoke("TTS engine is not ready yet.")
             return
         }
-
-        // Cancel any existing speech
-        if (state == State.SPEAKING) {
-            stopInternal()
-        }
-
-        // Parse JSON input
-        val text: String
-        val voice: String
-        val speed: Float
-        try {
-            val obj = JSONObject(json)
-            text = obj.getString("text")
-            voice = obj.optString("voice", "Hugo")
-            speed = obj.optDouble("speed", 1.0).toFloat()
-        } catch (e: Exception) {
-            Log.e(TAG, "Invalid JSON input: $json", e)
-            onError?.invoke("Invalid JSON input: ${e.message}")
-            return
-        }
-
         if (text.isBlank()) {
             Log.w(TAG, "speak() called with blank text — ignoring")
             return
         }
 
-        updateState(State.SPEAKING)
-
-        speakJob = scope.launch {
-            try {
-                withContext(Dispatchers.IO) {
-                    // Create AudioTrack for playback
-                    val track = createAudioTrack()
-                    audioTrack = track
-                    track.play()
-
-                    // Synthesize and play chunk by chunk
-                    engine.synthesizeStreaming(text, voice, speed) { pcmChunk ->
-                        if (!isActive) {
-                            // Coroutine was cancelled (stop() was called)
-                            return@synthesizeStreaming false
-                        }
-                        track.write(pcmChunk, 0, pcmChunk.size)
-                        isActive // return whether to continue
-                    }
-
-                    // Wait for AudioTrack to finish playing remaining buffered audio
-                    if (isActive) {
-                        track.stop()
-                        delay(300) // Ensure the hardware buffer fully flushes out the speaker
-                    }
-                    track.release()
-                    audioTrack = null
-                }
-
-                // Only fire completion callback if not cancelled
-                if (isActive) {
-                    updateState(State.IDLE)
-                    onSpeakComplete?.invoke()
-                }
-            } catch (e: CancellationException) {
-                // Normal cancellation — stop() was called
-                Log.d(TAG, "Speech cancelled")
-                updateState(State.IDLE)
-            } catch (e: Exception) {
-                Log.e(TAG, "Synthesis/playback error", e)
-                updateState(State.IDLE)
-                withContext(Dispatchers.Main) {
-                    onError?.invoke("TTS error: ${e.message}")
-                }
-            }
+        if (state == State.SPEAKING) {
+            engine.stop()
         }
+
+        updateState(State.SPEAKING)
+        engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, UTTERANCE_ID)
     }
 
     /**
-     * Immediately stop any ongoing speech synthesis and playback.
-     * This is how STT preemption works: call stop() before starting STT.
-     *
-     * Safe to call at any time — no-op if not speaking.
+     * Stop any ongoing speech.
      */
     fun stop() {
+        tts?.stop()
         if (state == State.SPEAKING) {
-            stopInternal()
             updateState(State.IDLE)
         }
     }
 
     /**
-     * Aggressively unload the engine from RAM without destroying the manager's coroutine scope.
-     * This allows STT to free memory while letting TTS re-initialize later.
+     * Compatibility shim — called by MainActivity before STT recording starts.
+     * With native TTS, we simply stop any current playback; no model to unload.
      */
     fun unloadModel() {
-        stopInternal()
-        engine.shutdown()
-        state = State.UNINITIALIZED
+        stop()
     }
 
     /**
-     * Release all resources permanently. Call in Activity.onDestroy().
+     * Release all resources permanently. Call from Activity.onDestroy().
      */
     fun release() {
-        unloadModel()
-        scope.cancel()
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
+        state = State.UNINITIALIZED
     }
 
-    // ── Internal helpers ──
+    // ── Internal ──
 
-    private fun stopInternal() {
-        speakJob?.cancel()
-        speakJob = null
+    private fun setupUtteranceListener() {
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
 
-        try {
-            audioTrack?.stop()
-        } catch (_: IllegalStateException) {
-            // AudioTrack may already be stopped
-        }
-        try {
-            audioTrack?.release()
-        } catch (_: Exception) {
-            // Ignore cleanup errors
-        }
-        audioTrack = null
-    }
+            override fun onDone(utteranceId: String?) {
+                if (state == State.SPEAKING) {
+                    updateState(State.IDLE)
+                    onSpeakComplete?.invoke()
+                }
+            }
 
-    private fun createAudioTrack(): AudioTrack {
-        val bufferSize = AudioTrack.getMinBufferSize(
-            KittenTTSEngine.SAMPLE_RATE,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                Log.e(TAG, "Utterance error for id: $utteranceId")
+                updateState(State.IDLE)
+                onError?.invoke("TTS playback error.")
+            }
 
-        return AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(KittenTTSEngine.SAMPLE_RATE)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build()
-            )
-            .setBufferSizeInBytes(bufferSize)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
+            override fun onError(utteranceId: String?, errorCode: Int) {
+                Log.e(TAG, "Utterance error for id: $utteranceId, code: $errorCode")
+                updateState(State.IDLE)
+                onError?.invoke("TTS playback error (code $errorCode).")
+            }
+        })
     }
 
     private fun updateState(newState: State) {
         state = newState
-        // Ensure callback fires on Main thread
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            onStateChanged?.invoke(newState)
-        } else {
-            scope.launch(Dispatchers.Main) {
-                onStateChanged?.invoke(newState)
-            }
-        }
+        onStateChanged?.invoke(newState)
     }
 }
